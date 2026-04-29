@@ -3,7 +3,7 @@
 **Live Server IP:** http://52.6.62.133  
 **Metrics Dashboard:** http://monitor.hngayotomiwa.online  
 **GitHub:** https://github.com/Zaamaar/hng-stage-3  
-**Blog Post:** BLOG_URL_HERE
+**Blog Post:** https://medium.com/@ayotomiwavictor1/how-i-built-a-real-time-ddos-detection-engine-from-scratch-b252db662ac0
 
 ## What This Does
 
