@@ -34,7 +34,13 @@ Client request
 
 ## How the Sliding Window Works
 
-Every request timestamp is appended to a per-IP deque and a global deque. Before every rate calculation, stale entries older than 60 seconds are evicted from the left with popleft(). Rate = len(deque) / window_seconds. No counters, no resets.
+Each IP address gets its own collections.deque that stores the Unix timestamps of every request that IP has made. A single global deque stores timestamps for all requests regardless of source. Neither deque has a fixed size limit; instead, stale entries are evicted on every log entry processed.
+
+When a new log entry arrives, the current time (time.time()) is appended to both the IP-specific deque and the global deque. A cutoff value is then calculated as now - 60, representing the start of the 60-second window. Any timestamp at the left of the deque that is older than the cutoff is removed with popleft() until the oldest remaining entry is within the window. Because timestamps are always appended in chronological order, this eviction is always O(k) where k is the number of expired entries, not O(n) over the whole deque.
+
+The length of the deque after eviction is the IP's request rate for the current 60-second window. This value is what gets compared against the baseline.
+
+The same structure is used to track 4xx and 5xx error responses per IP, using a separate error deque per IP and one global error deque.
 
 ## How the Baseline Works
 
@@ -51,10 +57,46 @@ To prevent division by zero in the z-score formula, both mean and stddev are flo
 mean=1.0, stddev=0.5).
 
 ## How Detection Works
+For every log entry processed, the detector computes a z-score for the source IP:
 
-Z-score: (ip_rate - mean) / stddev > 3.0 triggers a ban. Rate multiplier: ip_rate > 5x mean also triggers. Error surge tightens thresholds to z>2.0 and 3x. Global traffic check fires Slack-only alert.
+z_score = (ip_rate - mean) / stddev
 
-Ban backoff: 10min, 30min, 2hr, permanent.
+Where ip_rate is the number of requests from that IP in the last 60 seconds, and mean and stddev come from the baseline.
+
+An IP is flagged as anomalous if either of two conditions is true:
+
+The z-score exceeds 3.0. This means the IP's request rate is more than three standard deviations above the baseline mean, which is statistically unusual under normal traffic distributions.
+The raw rate exceeds 5 times the baseline mean. This catches burst attackers who ramp up so fast that the standard deviation has not had time to widen to reflect the change.
+A third condition modifies the z-score threshold rather than triggering a ban directly. If the proportion of 4xx and 5xx responses from an IP exceeds three times the global error proportion across all traffic, the z-score threshold for that IP is tightened from 3.0 to 2.0. This makes the detector more sensitive to IPs that are not just sending many requests but are also generating a high error rate, which is a common pattern in credential-stuffing and path-scanning attacks.
+
+## How iptables Blocking Works
+iptables is the Linux kernel's built-in packet filtering firewall. When the detector decides to block an IP, it runs the following command inside the container:
+
+```
+iptables -I DOCKER-USER -s <ip> -j DROP
+```
+
+The `-I DOCKER-USER` flag inserts the rule at the top of the `DOCKER-USER` chain, which Docker processes before its own forwarding rules, ensuring traffic from a blocked IP is dropped even for containerised services. The `-s <ip>` flag matches packets from the specified source address. The `-j DROP` target silently discards the packet without sending any response to the sender.
+
+The system applies escalating ban durations based on how many times an IP has been banned before:
+
+| Offence number | Ban duration |
+|----------------|--------------|
+| 1st            | 10 minutes   |
+| 2nd            | 30 minutes   |
+| 3rd            | 2 hours      |
+| 4th and beyond | Permanent    |
+
+A background thread checks every 30 seconds whether any active ban has expired. When a ban expires, the rule is removed with:
+
+```
+iptables -D DOCKER-USER -s <ip> -j DROP
+```
+
+The IP is then removed from the in-memory ban registry. A Slack alert is sent noting the next ban duration that will apply if the IP re-offends. Permanent bans are never automatically lifted.
+
+---
+
 
 ## Setup
 
