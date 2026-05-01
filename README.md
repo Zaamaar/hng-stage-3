@@ -11,7 +11,26 @@ Real-time HTTP traffic anomaly detection engine. Watches every Nginx request, le
 
 ## Why Python?
 
-collections.deque gives O(1) sliding window operations. Threading handles 4 daemon threads cleanly. subprocess calls iptables directly. Flask serves the metrics dashboard.
+Python was chosen for this project for several reasons. Python ships with a rich standard library that covers most of what this daemon needs: collections.deque for sliding windows, statistics for mean and standard deviation, threading for background workers, and http.server for the dashboard. The only third-party dependencies are pyyaml for config parsing, requests for Slack notifications, and psutil for system metrics. Python is also easy to read and audit, which matters for a security-adjacent tool where the logic must be transparent and verifiable. Performance is not a bottleneck here because the detection loop processes one log line at a time at the speed Nginx writes them, which is far below Python's throughput ceiling for this kind of I/O-bound work.
+
+## Architecture
+The system is composed of three Docker services connected on a shared bridge network:
+
+Nginx receives all incoming HTTP requests on port 80 and proxies them to the Nextcloud container. It writes every request as a JSON object to a shared Docker volume at /var/log/nginx/hng-access.log. Each log entry contains the source IP, timestamp, HTTP method, path, response status, and response size.
+
+Nextcloud is the protected application. It sits behind Nginx and never receives direct external traffic.
+
+Detector mounts the Nginx log volume in read-only mode and tails the log file as a stream. For every new log entry it maintains sliding windows per IP, computes anomaly scores against a rolling baseline, and takes action when thresholds are exceeded. The detector container is given the NET_ADMIN capability so it can issue iptables commands that affect the host network.
+
+The full flow for a single request is:
+
+Client request
+  -> Nginx (logs JSON entry to shared volume)
+  -> Detector reads new log line
+  -> Updates sliding windows and baseline
+  -> Runs anomaly checks
+  -> If anomaly: iptables DROP rule added, Slack alert sent, audit log written
+  -> Dashboard reflects updated state within 3 seconds
 
 ## How the Sliding Window Works
 
@@ -19,7 +38,17 @@ Every request timestamp is appended to a per-IP deque and a global deque. Before
 
 ## How the Baseline Works
 
-Every second, the request count is stored in a 30-minute rolling deque and also bucketed by hour. Every 60 seconds, mean and stddev are recalculated. Priority: hourly slot (30+ samples) then rolling window then floor values (mean=1.0, stddev=0.5).
+The baseline answers the question: what is the normal request rate on this system right now? It maintains two data structures simultaneously.
+
+The first is a collections.deque with maxlen=1800. Each slot holds the total request count for one second. Because the deque is capped at 1800 entries, it automatically evicts counts older than 30 minutes when new ones are appended. This is the rolling window.
+
+The second is a dictionary keyed by hour (0 through 23), where each value is a list of per-second counts recorded during that hour. This captures the natural traffic rhythm of the day: traffic at 2am behaves differently from traffic at 2pm. Each hourly list is trimmed to a maximum of 3600 entries (one hour of per-second samples) to bound memory usage.
+
+Every time a new count is added via add_count(), the baseline checks whether 60 seconds have elapsed since the last recalculation. If so, it recomputes the mean and standard deviation using Python's statistics.mean and statistics.stdev. The data source for recalculation is chosen as follows: if the current hour's slot has more than 60 data points, it uses that slot because it reflects the traffic pattern for this specific time of day. Otherwise it falls back to the full 30-minute rolling window.
+
+To prevent division by zero in the z-score formula, both mean and stddev are floored at 1.0 and 0.5 regardless of what the calculation produces.
+
+mean=1.0, stddev=0.5).
 
 ## How Detection Works
 
